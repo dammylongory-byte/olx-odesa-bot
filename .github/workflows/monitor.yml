@@ -38,6 +38,8 @@ jobs:
           OLX_SEARCH_URL: ${{ secrets.OLX_SEARCH_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_NOTIFY_CHAT_ID: ${{ secrets.TELEGRAM_NOTIFY_CHAT_ID }}
+          TELEGRAM_NOTIFY_THREAD_ID: ${{ secrets.TELEGRAM_NOTIFY_THREAD_ID }}
         run: python main.py
 
       - name: Save seen.json back to repo
