@@ -2,7 +2,7 @@ name: OLX Odesa monitor
 
 on:
   schedule:
-    - cron: "*/15 * * * *"   # каждые 15 минут
+        - cron: "*/5 * * * *"   # каждые 5 минут
   workflow_dispatch:          # ручной запуск для теста
 
 permissions:
