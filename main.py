@@ -1,7 +1,7 @@
 import os
 import json
-import time
 import re
+import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from playwright.sync_api import sync_playwright
@@ -25,7 +25,7 @@ DEFAULT_OLX_SEARCH_URL = (
 OLX_SEARCH_URL = os.environ.get("OLX_SEARCH_URL") or DEFAULT_OLX_SEARCH_URL
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]  # личный чат - команды/статус
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]  # личный чат - команды/статус/алерты
 # Куда слать сами уведомления об объявлениях. Если не задано - используется
 # TELEGRAM_CHAT_ID (личка), как было раньше.
 TELEGRAM_NOTIFY_CHAT_ID = os.environ.get("TELEGRAM_NOTIFY_CHAT_ID") or TELEGRAM_CHAT_ID
@@ -36,6 +36,18 @@ SEEN_FILE = "seen.json"
 STATE_FILE = "bot_state.json"
 TZ = ZoneInfo("Europe/Kyiv")
 
+# Ночной режим: не проверяем сайт в это время (по киевскому времени).
+# Расписание в GitHub Actions тоже не запускает джобу в это время - здесь
+# это подстраховка на случай ручного запуска или сдвига по границе часа.
+NIGHT_START_HOUR = 2
+NIGHT_END_HOUR = 6
+
+# После скольки проверок подряд без объявлений слать тревогу в личку.
+FAILURE_ALERT_THRESHOLD = 3
+# Через сколько дополнительных неудачных проверок повторять тревогу,
+# если проблема не решилась (12 проверок * 5 минут = ~1 час).
+FAILURE_ALERT_REPEAT_EVERY = 12
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -45,11 +57,12 @@ HELP_TEXT = (
     "🏠 <b>OLX Odesa monitor</b>\n\n"
     "Слежу за новыми объявлениями недвижимости в Одессе от собственников "
     "на OLX и присылаю уведомления, как только появляется что-то новое.\n\n"
-    "Проверяю сайт раз в 5 минут, поэтому ответы на команды тоже могут "
-    "приходить с задержкой до 5 минут - это не сбой, так работает бесплатное "
-    "расписание GitHub Actions.\n\n"
+    "Проверяю сайт раз в 5 минут (кроме ночи с 2:00 до 6:00), поэтому "
+    "ответы на команды тоже могут приходить с задержкой - это не сбой, "
+    "так работает бесплатное расписание GitHub Actions.\n\n"
     "<b>Команды:</b>\n"
     "/status - текущий статус мониторинга\n"
+    "/stats - статистика за сегодня и за 7 дней\n"
     "/help - это сообщение"
 )
 
@@ -73,6 +86,8 @@ def load_state():
         "last_check": None,
         "last_new_count": 0,
         "checks_count": 0,
+        "consecutive_failures": 0,
+        "daily_stats": {},  # {"17.08.2026": {"count": N, "price_sum": X, "price_count": M}}
     }
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r", encoding="utf-8") as f:
@@ -82,8 +97,22 @@ def load_state():
 
 
 def save_state(state):
+    # оставляем статистику только за последние 8 дней, чтобы файл не рос
+    if len(state.get("daily_stats", {})) > 8:
+        sorted_dates = sorted(
+            state["daily_stats"].keys(),
+            key=lambda d: datetime.strptime(d, "%d.%m.%Y"),
+        )
+        for old_date in sorted_dates[:-8]:
+            del state["daily_stats"][old_date]
+
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False)
+
+
+def is_night_time():
+    hour = datetime.now(TZ).hour
+    return NIGHT_START_HOUR <= hour < NIGHT_END_HOUR
 
 
 def send_telegram(text, chat_id=None, message_thread_id=None):
@@ -100,18 +129,54 @@ def send_telegram(text, chat_id=None, message_thread_id=None):
     r.raise_for_status()
 
 
+def parse_price_usd(price_str):
+    """Вытаскивает число из строки вида '32 000 $ Договірна' -> 32000.
+    Если цена договорная без числа - возвращает None."""
+    match = re.search(r"([\d\s]+)\s*\$", price_str or "")
+    if not match:
+        return None
+    digits = match.group(1).replace(" ", "").replace("\xa0", "")
+    return int(digits) if digits.isdigit() else None
+
+
 def status_text(state):
-    if state["last_check"]:
-        last_check = state["last_check"]
-    else:
-        last_check = "ещё не было"
-    return (
-        "✅ <b>Бот работает</b>\n\n"
-        f"Последняя проверка: {last_check}\n"
-        f"Новых объявлений в последний раз: {state['last_new_count']}\n"
-        f"Всего проверок: {state['checks_count']}\n"
-        f"Проверяю раз в 5 минут"
-    )
+    last_check = state["last_check"] or "ещё не было"
+    lines = [
+        "✅ <b>Бот работает</b>\n",
+        f"Последняя проверка: {last_check}",
+        f"Новых объявлений в последний раз: {state['last_new_count']}",
+        f"Всего проверок: {state['checks_count']}",
+    ]
+    if state["consecutive_failures"] >= FAILURE_ALERT_THRESHOLD:
+        lines.append(
+            f"⚠️ Проверок подряд без объявлений: {state['consecutive_failures']}"
+        )
+    lines.append("Проверяю раз в 5 минут (кроме ночи 2:00-6:00)")
+    return "\n".join(lines)
+
+
+def stats_text(state):
+    today_key = datetime.now(TZ).strftime("%d.%m.%Y")
+    daily = state.get("daily_stats", {})
+    today = daily.get(today_key, {"count": 0, "price_sum": 0, "price_count": 0})
+
+    week_count = sum(d["count"] for d in daily.values())
+    week_price_sum = sum(d["price_sum"] for d in daily.values())
+    week_price_count = sum(d["price_count"] for d in daily.values())
+
+    lines = ["📊 <b>Статистика</b>\n", "<b>Сегодня:</b>", f"Новых объявлений: {today['count']}"]
+    if today["price_count"] > 0:
+        avg_today = today["price_sum"] // today["price_count"]
+        lines.append(f"Средняя цена: ${avg_today:,}".replace(",", " "))
+
+    lines.append("")
+    lines.append(f"<b>За последние {len(daily)} дн.:</b>")
+    lines.append(f"Новых объявлений: {week_count}")
+    if week_price_count > 0:
+        avg_week = week_price_sum // week_price_count
+        lines.append(f"Средняя цена: ${avg_week:,}".replace(",", " "))
+
+    return "\n".join(lines)
 
 
 def handle_commands(state):
@@ -145,6 +210,8 @@ def handle_commands(state):
             send_telegram(HELP_TEXT, chat_id=chat_id)
         elif text.startswith("/status"):
             send_telegram(status_text(state), chat_id=chat_id)
+        elif text.startswith("/stats"):
+            send_telegram(stats_text(state), chat_id=chat_id)
 
 
 def fetch_listings():
@@ -211,11 +278,51 @@ def format_message(item):
     return "\n".join(lines)
 
 
+def record_stats(state, sent_items):
+    """Обновляет дневную статистику отправленными сегодня объявлениями."""
+    today_key = datetime.now(TZ).strftime("%d.%m.%Y")
+    daily = state.setdefault("daily_stats", {})
+    today = daily.setdefault(today_key, {"count": 0, "price_sum": 0, "price_count": 0})
+
+    for item in sent_items:
+        today["count"] += 1
+        price = parse_price_usd(item["price"])
+        if price is not None:
+            today["price_sum"] += price
+            today["price_count"] += 1
+
+
+def handle_fetch_failure(state):
+    """Считает подряд идущие неудачные проверки и шлёт тревогу в личку."""
+    state["consecutive_failures"] = state.get("consecutive_failures", 0) + 1
+    failures = state["consecutive_failures"]
+
+    should_alert = failures == FAILURE_ALERT_THRESHOLD or (
+        failures > FAILURE_ALERT_THRESHOLD
+        and (failures - FAILURE_ALERT_THRESHOLD) % FAILURE_ALERT_REPEAT_EVERY == 0
+    )
+    if should_alert:
+        send_telegram(
+            "⚠️ <b>Проблема с мониторингом OLX</b>\n\n"
+            f"Уже {failures} проверок подряд не удалось получить объявления - "
+            "похоже на блокировку антиботом или OLX поменял вёрстку сайта.\n\n"
+            "Загляните в GitHub → Actions → последний запуск → лог 'Run monitor', "
+            "там будет подробность. Раздел README 'Если начались блокировки' "
+            "подскажет, что делать дальше."
+        )
+
+
 def main():
     state = load_state()
 
-    # Сначала отвечаем на команды, которые могли прийти с прошлого запуска
+    # Сначала отвечаем на команды, которые могли прийти с прошлого запуска -
+    # это дёшево (без браузера), поэтому делаем даже ночью.
     handle_commands(state)
+
+    if is_night_time():
+        print("Ночной режим (2:00-6:00) - пропускаем проверку сайта.")
+        save_state(state)
+        return
 
     seen = load_seen()
     listings = fetch_listings()
@@ -231,9 +338,11 @@ def main():
             "блокировки' в README."
         )
         state["last_new_count"] = 0
+        handle_fetch_failure(state)
         save_state(state)
         return
 
+    state["consecutive_failures"] = 0  # сайт снова отвечает нормально
     print(f"Найдено объявлений на странице: {len(listings)}")
 
     # Первый запуск: просто запоминаем текущие объявления,
@@ -262,7 +371,7 @@ def main():
     older_items = [item for item in new_items if item not in todays_items]
 
     all_seen = set(seen)
-    sent = 0
+    sent_items = []
     for item in reversed(todays_items):  # от старых к новым
         send_telegram(
             format_message(item),
@@ -270,17 +379,18 @@ def main():
             message_thread_id=TELEGRAM_NOTIFY_THREAD_ID,
         )
         all_seen.add(item["id"])
-        sent += 1
+        sent_items.append(item)
         time.sleep(1)  # чтобы не упереться в лимиты Telegram
 
     for item in older_items:
         all_seen.add(item["id"])  # запоминаем, но не уведомляем
 
+    record_stats(state, sent_items)
     save_seen(all_seen)
-    state["last_new_count"] = sent
+    state["last_new_count"] = len(sent_items)
     save_state(state)
     print(
-        f"Отправлено новых объявлений за сегодня: {sent} "
+        f"Отправлено новых объявлений за сегодня: {len(sent_items)} "
         f"(пропущено старых/промо: {len(older_items)})"
     )
 
