@@ -25,7 +25,13 @@ DEFAULT_OLX_SEARCH_URL = (
 OLX_SEARCH_URL = os.environ.get("OLX_SEARCH_URL") or DEFAULT_OLX_SEARCH_URL
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]  # личный чат - команды/статус
+# Куда слать сами уведомления об объявлениях. Если не задано - используется
+# TELEGRAM_CHAT_ID (личка), как было раньше.
+TELEGRAM_NOTIFY_CHAT_ID = os.environ.get("TELEGRAM_NOTIFY_CHAT_ID") or TELEGRAM_CHAT_ID
+# Если группа с темами (topics) и уведомления нужны в конкретную тему -
+# укажите её id. Необязательно.
+TELEGRAM_NOTIFY_THREAD_ID = os.environ.get("TELEGRAM_NOTIFY_THREAD_ID") or None
 SEEN_FILE = "seen.json"
 STATE_FILE = "bot_state.json"
 TZ = ZoneInfo("Europe/Kyiv")
@@ -80,7 +86,7 @@ def save_state(state):
         json.dump(state, f, ensure_ascii=False)
 
 
-def send_telegram(text, chat_id=None):
+def send_telegram(text, chat_id=None, message_thread_id=None):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id or TELEGRAM_CHAT_ID,
@@ -88,6 +94,8 @@ def send_telegram(text, chat_id=None):
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
     }
+    if message_thread_id:
+        payload["message_thread_id"] = message_thread_id
     r = requests.post(url, data=payload, timeout=15)
     r.raise_for_status()
 
@@ -256,7 +264,11 @@ def main():
     all_seen = set(seen)
     sent = 0
     for item in reversed(todays_items):  # от старых к новым
-        send_telegram(format_message(item))
+        send_telegram(
+            format_message(item),
+            chat_id=TELEGRAM_NOTIFY_CHAT_ID,
+            message_thread_id=TELEGRAM_NOTIFY_THREAD_ID,
+        )
         all_seen.add(item["id"])
         sent += 1
         time.sleep(1)  # чтобы не упереться в лимиты Telegram
