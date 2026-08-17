@@ -245,18 +245,32 @@ def main():
         save_state(state)
         return
 
+    # Среди "новых по ID" бывают старые объявления, которые OLX иногда
+    # закрепляет наверху выдачи (топ/промо) независимо от даты публикации -
+    # они просто раньше не попадали в наш срез. Отправляем уведомление
+    # только если в дате стоит "Сьогодні" (сегодня), а остальные молча
+    # помечаем как просмотренные, чтобы не проверять их повторно и не слать.
+    todays_items = [item for item in new_items if "сьогодні" in item["location"].lower()]
+    older_items = [item for item in new_items if item not in todays_items]
+
     all_seen = set(seen)
     sent = 0
-    for item in reversed(new_items):  # от старых к новым
+    for item in reversed(todays_items):  # от старых к новым
         send_telegram(format_message(item))
         all_seen.add(item["id"])
         sent += 1
         time.sleep(1)  # чтобы не упереться в лимиты Telegram
 
+    for item in older_items:
+        all_seen.add(item["id"])  # запоминаем, но не уведомляем
+
     save_seen(all_seen)
     state["last_new_count"] = sent
     save_state(state)
-    print(f"Отправлено новых объявлений: {sent}")
+    print(
+        f"Отправлено новых объявлений за сегодня: {sent} "
+        f"(пропущено старых/промо: {len(older_items)})"
+    )
 
 
 if __name__ == "__main__":
