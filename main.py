@@ -217,7 +217,9 @@ def handle_commands(state):
 def fetch_listings():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        context = browser.new_context(user_agent=USER_AGENT, locale="uk-UA")
+        context = browser.new_context(
+            user_agent=USER_AGENT, locale="uk-UA", timezone_id="Europe/Kyiv"
+        )
         page = context.new_page()
 
         try:
