@@ -2,6 +2,8 @@ import os
 import json
 import time
 import re
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from playwright.sync_api import sync_playwright
 import requests
 
@@ -25,10 +27,24 @@ OLX_SEARCH_URL = os.environ.get("OLX_SEARCH_URL") or DEFAULT_OLX_SEARCH_URL
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 SEEN_FILE = "seen.json"
+STATE_FILE = "bot_state.json"
+TZ = ZoneInfo("Europe/Kyiv")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
+
+HELP_TEXT = (
+    "🏠 <b>OLX Odesa monitor</b>\n\n"
+    "Слежу за новыми объявлениями недвижимости в Одессе от собственников "
+    "на OLX и присылаю уведомления, как только появляется что-то новое.\n\n"
+    "Проверяю сайт раз в 5 минут, поэтому ответы на команды тоже могут "
+    "приходить с задержкой до 5 минут - это не сбой, так работает бесплатное "
+    "расписание GitHub Actions.\n\n"
+    "<b>Команды:</b>\n"
+    "/status - текущий статус мониторинга\n"
+    "/help - это сообщение"
 )
 
 
@@ -43,6 +59,84 @@ def save_seen(seen_ids):
     trimmed = list(seen_ids)[-3000:]  # чтобы файл не рос бесконечно
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(trimmed, f, ensure_ascii=False)
+
+
+def load_state():
+    default_state = {
+        "update_offset": 0,
+        "last_check": None,
+        "last_new_count": 0,
+        "checks_count": 0,
+    }
+    if os.path.exists(STATE_FILE):
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        default_state.update(data)
+    return default_state
+
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False)
+
+
+def send_telegram(text, chat_id=None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": chat_id or TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": False,
+    }
+    r = requests.post(url, data=payload, timeout=15)
+    r.raise_for_status()
+
+
+def status_text(state):
+    if state["last_check"]:
+        last_check = state["last_check"]
+    else:
+        last_check = "ещё не было"
+    return (
+        "✅ <b>Бот работает</b>\n\n"
+        f"Последняя проверка: {last_check}\n"
+        f"Новых объявлений в последний раз: {state['last_new_count']}\n"
+        f"Всего проверок: {state['checks_count']}\n"
+        f"Проверяю раз в 5 минут"
+    )
+
+
+def handle_commands(state):
+    """Забирает новые входящие сообщения и отвечает на команды.
+    Отвечает только в тот же чат, что указан в TELEGRAM_CHAT_ID -
+    чтобы посторонние не могли использовать бота, даже если напишут ему."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params = {"offset": state["update_offset"] + 1, "timeout": 0}
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        updates = resp.json().get("result", [])
+    except Exception as e:
+        print(f"Не удалось получить обновления Telegram: {e}")
+        return
+
+    for update in updates:
+        state["update_offset"] = max(state["update_offset"], update["update_id"])
+        message = update.get("message")
+        if not message:
+            continue
+
+        chat_id = str(message.get("chat", {}).get("id", ""))
+        text = (message.get("text") or "").strip()
+
+        # Отвечаем только владельцу бота (тому chat_id, что в секретах)
+        if chat_id != str(TELEGRAM_CHAT_ID):
+            continue
+
+        if text.startswith("/start") or text.startswith("/help"):
+            send_telegram(HELP_TEXT, chat_id=chat_id)
+        elif text.startswith("/status"):
+            send_telegram(status_text(state), chat_id=chat_id)
 
 
 def fetch_listings():
@@ -109,21 +203,18 @@ def format_message(item):
     return "\n".join(lines)
 
 
-def send_telegram(text):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False,
-    }
-    r = requests.post(url, data=payload, timeout=15)
-    r.raise_for_status()
-
-
 def main():
+    state = load_state()
+
+    # Сначала отвечаем на команды, которые могли прийти с прошлого запуска
+    handle_commands(state)
+
     seen = load_seen()
     listings = fetch_listings()
+
+    now_str = datetime.now(TZ).strftime("%d.%m %H:%M")
+    state["last_check"] = now_str
+    state["checks_count"] = state.get("checks_count", 0) + 1
 
     if not listings:
         print(
@@ -131,6 +222,8 @@ def main():
             "либо изменилась вёрстка сайта. См. раздел 'Если начались "
             "блокировки' в README."
         )
+        state["last_new_count"] = 0
+        save_state(state)
         return
 
     print(f"Найдено объявлений на странице: {len(listings)}")
@@ -139,6 +232,8 @@ def main():
     # чтобы не заспамить чат всей историей сразу
     if not seen:
         save_seen({item["id"] for item in listings})
+        state["last_new_count"] = 0
+        save_state(state)
         print(f"Первый запуск: сохранено {len(listings)} объявлений, уведомления не отправлялись.")
         return
 
@@ -146,6 +241,8 @@ def main():
 
     if not new_items:
         print("Новых объявлений нет.")
+        state["last_new_count"] = 0
+        save_state(state)
         return
 
     all_seen = set(seen)
@@ -157,6 +254,8 @@ def main():
         time.sleep(1)  # чтобы не упереться в лимиты Telegram
 
     save_seen(all_seen)
+    state["last_new_count"] = sent
+    save_state(state)
     print(f"Отправлено новых объявлений: {sent}")
 
 
