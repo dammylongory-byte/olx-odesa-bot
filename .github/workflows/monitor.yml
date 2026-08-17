@@ -1,0 +1,49 @@
+name: OLX Odesa monitor
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"   # каждые 15 минут
+  workflow_dispatch:          # ручной запуск для теста
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}
+
+      - name: Install Playwright browser
+        run: playwright install --with-deps chromium
+        # Не пропускаем даже при попадании в кэш - "--with-deps" также
+        # ставит нужные системные библиотеки, это быстро при готовом кэше.
+
+      - name: Run monitor
+        env:
+          OLX_SEARCH_URL: ${{ secrets.OLX_SEARCH_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python main.py
+
+      - name: Save seen.json back to repo
+        run: |
+          git config user.name "olx-bot"
+          git config user.email "olx-bot@users.noreply.github.com"
+          git add seen.json
+          git diff --staged --quiet || git commit -m "update seen ads"
+          git push
