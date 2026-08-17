@@ -8,15 +8,19 @@ import requests
 # Ссылка на поиск с вашими фильтрами (Одесса, недвижимость, продажа,
 # только от собственников - параметр search[private_business]=private).
 # Можно поменять на другую ссылку с сайта - см. README.
-OLX_SEARCH_URL = os.environ.get(
-    "OLX_SEARCH_URL",
+# ВАЖНО: используем "or", а не .get(key, default) - если секрет
+# OLX_SEARCH_URL не задан в GitHub Actions, переменная окружения всё
+# равно приходит как пустая строка, а не отсутствует, и .get() с
+# default её не подставит.
+DEFAULT_OLX_SEARCH_URL = (
     "https://www.olx.ua/uk/nedvizhimost/odessa/"
     "?currency=USD"
     "&search%5Bfilter_float_price%3Afrom%5D=2000"
     "&search%5Border%5D=created_at%3Adesc"
     "&search%5Bphotos%5D=1"
-    "&search%5Bprivate_business%5D=private",
+    "&search%5Bprivate_business%5D=private"
 )
+OLX_SEARCH_URL = os.environ.get("OLX_SEARCH_URL") or DEFAULT_OLX_SEARCH_URL
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
