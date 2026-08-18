@@ -2,7 +2,7 @@ import os
 import json
 import re
 import time
-from datetime import datetime
+from datetime import datetime, date
 from zoneinfo import ZoneInfo
 from playwright.sync_api import sync_playwright
 import requests
@@ -39,7 +39,7 @@ TZ = ZoneInfo("Europe/Kyiv")
 # Ночной режим: не проверяем сайт в это время (по киевскому времени).
 # Расписание в GitHub Actions тоже не запускает джобу в это время - здесь
 # это подстраховка на случай ручного запуска или сдвига по границе часа.
-NIGHT_START_HOUR = 2
+NIGHT_START_HOUR = 0
 NIGHT_END_HOUR = 6
 
 # После скольки проверок подряд без объявлений слать тревогу в личку.
@@ -47,6 +47,12 @@ FAILURE_ALERT_THRESHOLD = 3
 # Через сколько дополнительных неудачных проверок повторять тревогу,
 # если проблема не решилась (12 проверок * 5 минут = ~1 час).
 FAILURE_ALERT_REPEAT_EVERY = 12
+
+# Дата истечения GitHub-токена, которым внешний будильник (cron-job.org)
+# дёргает запуск этого workflow. За 7 дней до истечения бот сам напомнит
+# в личку, что токен пора обновить - см. README, раздел про cron-job.org.
+GITHUB_TOKEN_EXPIRY = date(2026, 9, 17)
+TOKEN_EXPIRY_WARNING_DAYS = 7
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -57,7 +63,7 @@ HELP_TEXT = (
     "🏠 <b>OLX Odesa monitor</b>\n\n"
     "Слежу за новыми объявлениями недвижимости в Одессе от собственников "
     "на OLX и присылаю уведомления, как только появляется что-то новое.\n\n"
-    "Проверяю сайт раз в 5 минут (кроме ночи с 2:00 до 6:00), поэтому "
+    "Проверяю сайт раз в 5 минут (кроме ночи с 0:00 до 6:00), поэтому "
     "ответы на команды тоже могут приходить с задержкой - это не сбой, "
     "так работает бесплатное расписание GitHub Actions.\n\n"
     "<b>Команды:</b>\n"
@@ -151,7 +157,7 @@ def status_text(state):
         lines.append(
             f"⚠️ Проверок подряд без объявлений: {state['consecutive_failures']}"
         )
-    lines.append("Проверяю раз в 5 минут (кроме ночи 2:00-6:00)")
+    lines.append("Проверяю раз в 5 минут (кроме ночи 0:00-6:00)")
     return "\n".join(lines)
 
 
@@ -314,6 +320,43 @@ def handle_fetch_failure(state):
         )
 
 
+def check_token_expiry(state):
+    """Раз в день предупреждает в личку, если GitHub-токен для внешнего
+    будильника (cron-job.org) скоро истечёт."""
+    days_left = (GITHUB_TOKEN_EXPIRY - date.today()).days
+    if days_left < 0 or days_left > TOKEN_EXPIRY_WARNING_DAYS:
+        return
+
+    today_key = date.today().isoformat()
+    if state.get("token_expiry_alert_sent_on") == today_key:
+        return  # уже предупреждали сегодня
+
+    if days_left == 0:
+        text = (
+            "🔑 <b>Токен для будильника истекает сегодня!</b>\n\n"
+            "GitHub-токен, которым cron-job.org запускает проверку каждые "
+            "5 минут, истекает сегодня. Как только он перестанет работать, "
+            "cron-job.org больше не сможет дёргать бота (само расписание "
+            "GitHub Actions при этом продолжит работать, но гораздо реже).\n\n"
+            "Что делать: создайте новый Fine-grained token в GitHub → "
+            "Settings → Developer settings → Personal access tokens (те же "
+            "настройки, что и раньше - доступ только к этому репозиторию, "
+            "право Actions: Read and write), и обновите заголовок "
+            "Authorization в задании на cron-job.org."
+        )
+    else:
+        text = (
+            "🔑 <b>Скоро истечёт токен для будильника</b>\n\n"
+            f"GitHub-токен, которым cron-job.org запускает проверку каждые "
+            f"5 минут, истекает через {days_left} дн. "
+            "(17 сентября 2026). Заранее создайте новый токен и обновите "
+            "его в настройках задания на cron-job.org, чтобы бот не "
+            "перешёл обратно на медленное расписание GitHub."
+        )
+    send_telegram(text)
+    state["token_expiry_alert_sent_on"] = today_key
+
+
 def main():
     state = load_state()
 
@@ -321,8 +364,10 @@ def main():
     # это дёшево (без браузера), поэтому делаем даже ночью.
     handle_commands(state)
 
+    check_token_expiry(state)
+
     if is_night_time():
-        print("Ночной режим (2:00-6:00) - пропускаем проверку сайта.")
+        print("Ночной режим (0:00-6:00) - пропускаем проверку сайта.")
         save_state(state)
         return
 
