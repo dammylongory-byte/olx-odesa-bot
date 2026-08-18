@@ -220,6 +220,59 @@ def handle_commands(state):
             send_telegram(stats_text(state), chat_id=chat_id)
 
 
+# Сколько страниц выдачи сканировать за один прогон. Одна страница - это
+# ~50 карточек; при всплеске новых объявлений между проверками (раз в
+# 5 минут) этого может не хватить - свежее объявление успевает уйти
+# за первую страницу раньше следующей проверки. Две страницы дают запас.
+PAGES_TO_SCAN = 2
+
+
+def _extract_cards(page):
+    cards = page.query_selector_all('[data-testid="l-card"]')
+    results = []
+    for card in cards:
+        try:
+            card_id = card.get_attribute("id")
+            title_el = card.query_selector('[data-testid="card-title-link"]')
+            price_el = card.query_selector('[data-testid="ad-price"]')
+            loc_el = card.query_selector('[data-testid="location-date"]')
+
+            href = title_el.get_attribute("href") if title_el else None
+            if not card_id or not href:
+                continue
+
+            title = title_el.inner_text().strip() if title_el else "Объявление"
+            price_raw = price_el.inner_text().strip() if price_el else ""
+            # Отделяем "Договірна"/"Договорная" от суммы, если слиплись вместе
+            price = re.sub(r"(Договірна|Договорная)$", r" \1", price_raw).strip()
+            location = loc_el.inner_text().strip() if loc_el else ""
+
+            url = href if href.startswith("http") else f"https://www.olx.ua{href}"
+            # Убираем служебные метки вида ?search_reason=... из ссылки
+            url = url.split("?search_reason")[0]
+
+            results.append(
+                {
+                    "id": card_id,
+                    "title": title,
+                    "price": price,
+                    "location": location,
+                    "url": url,
+                }
+            )
+        except Exception as e:
+            print(f"Пропущена карточка из-за ошибки парсинга: {e}")
+            continue
+    return results
+
+
+def _add_page_param(url, page_num):
+    if page_num <= 1:
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}page={page_num}"
+
+
 def fetch_listings():
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -228,52 +281,30 @@ def fetch_listings():
         )
         page = context.new_page()
 
-        try:
-            page.goto(OLX_SEARCH_URL, timeout=60000, wait_until="domcontentloaded")
-            page.wait_for_selector('[data-testid="l-card"]', timeout=20000)
-        except Exception as e:
-            print(f"Не удалось загрузить страницу или найти объявления: {e}")
-            browser.close()
-            return []
+        all_results = []
+        seen_ids_this_fetch = set()
 
-        cards = page.query_selector_all('[data-testid="l-card"]')
-        results = []
-        for card in cards:
+        for page_num in range(1, PAGES_TO_SCAN + 1):
+            page_url = _add_page_param(OLX_SEARCH_URL, page_num)
             try:
-                card_id = card.get_attribute("id")
-                title_el = card.query_selector('[data-testid="card-title-link"]')
-                price_el = card.query_selector('[data-testid="ad-price"]')
-                loc_el = card.query_selector('[data-testid="location-date"]')
-
-                href = title_el.get_attribute("href") if title_el else None
-                if not card_id or not href:
-                    continue
-
-                title = title_el.inner_text().strip() if title_el else "Объявление"
-                price_raw = price_el.inner_text().strip() if price_el else ""
-                # Отделяем "Договірна"/"Договорная" от суммы, если слиплись вместе
-                price = re.sub(r"(Договірна|Договорная)$", r" \1", price_raw).strip()
-                location = loc_el.inner_text().strip() if loc_el else ""
-
-                url = href if href.startswith("http") else f"https://www.olx.ua{href}"
-                # Убираем служебные метки вида ?search_reason=... из ссылки
-                url = url.split("?search_reason")[0]
-
-                results.append(
-                    {
-                        "id": card_id,
-                        "title": title,
-                        "price": price,
-                        "location": location,
-                        "url": url,
-                    }
-                )
+                page.goto(page_url, timeout=60000, wait_until="domcontentloaded")
+                page.wait_for_selector('[data-testid="l-card"]', timeout=20000)
             except Exception as e:
-                print(f"Пропущена карточка из-за ошибки парсинга: {e}")
-                continue
+                print(f"Не удалось загрузить страницу {page_num}: {e}")
+                if page_num == 1:
+                    # Если не удалась даже первая страница - это блокировка
+                    # или изменилась вёрстка, дальше сканировать бессмысленно
+                    browser.close()
+                    return []
+                break  # вторая+ страница не загрузилась - используем то, что уже есть
+
+            for item in _extract_cards(page):
+                if item["id"] not in seen_ids_this_fetch:
+                    seen_ids_this_fetch.add(item["id"])
+                    all_results.append(item)
 
         browser.close()
-        return results
+        return all_results
 
 
 def format_message(item):
@@ -390,7 +421,7 @@ def main():
         return
 
     state["consecutive_failures"] = 0  # сайт снова отвечает нормально
-    print(f"Найдено объявлений на странице: {len(listings)}")
+    print(f"Найдено объявлений (стр. 1-{PAGES_TO_SCAN}): {len(listings)}")
 
     # Первый запуск: просто запоминаем текущие объявления,
     # чтобы не заспамить чат всей историей сразу
