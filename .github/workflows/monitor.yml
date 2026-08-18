@@ -1,9 +1,21 @@
 name: OLX Odesa monitor
 
 on:
-  schedule:
-                - cron: "2,7,12,17,22,27,32,37,42,47,52,57 3-20 * * *"   # каждые 5 минут, 6:00-00:00 по Киеву
-  workflow_dispatch:          # ручной запуск для теста
+  # Расписание запускает внешний будильник cron-job.org (см. README) -
+  # он надёжнее внутреннего schedule-триггера GitHub, который может
+  # задерживаться на час и более при частых интервалах. Внутренний
+  # schedule здесь намеренно убран - если оставить оба триггера, они
+  # иногда стартуют почти одновременно и конфликтуют при сохранении
+  # seen.json (второй прогон не может запушить, remote уже обновлён).
+  workflow_dispatch:
+
+# Если два запуска всё же наложатся по времени (например, ручной запуск
+# совпал с автоматическим) - GitHub поставит второй в очередь и запустит
+# по завершении первого, а не одновременно. Это устраняет конфликты при
+# сохранении seen.json обратно в репозиторий.
+concurrency:
+  group: olx-monitor
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -49,4 +61,5 @@ jobs:
           git add seen.json
           git add bot_state.json
           git diff --staged --quiet || git commit -m "update seen ads"
+          git pull --rebase --autostash
           git push
