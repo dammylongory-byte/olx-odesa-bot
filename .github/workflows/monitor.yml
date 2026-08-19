@@ -17,14 +17,14 @@ concurrency:
 
 # Общий предохранитель: если что-то всё же зависнет (например, сама
 # установка браузера или сеть до OLX) - принудительно обрываем прогон
-# через 5 минут вместо того чтобы висеть неограниченно долго.
+# через 8 минут вместо того чтобы висеть неограниченно долго.
 permissions:
   contents: write
 
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
 
@@ -43,7 +43,7 @@ jobs:
           key: playwright-chromium-${{ runner.os }}
 
       - name: Install Playwright browser
-        timeout-minutes: 3
+        timeout-minutes: 6
         run: playwright install chromium
         # Без "--with-deps" - этот флаг раньше вызывал apt-get update
         # против внешних зеркал Ubuntu/Microsoft НА КАЖДОМ прогоне (кэш
@@ -51,6 +51,8 @@ jobs:
         # было причиной задержек в 3-5 минут, а иногда и 35+. Нужные для
         # headless Chromium библиотеки на стандартных раннерах GitHub
         # (ubuntu-latest) уже есть, apt-get тут не требуется.
+        # timeout 6 минут - с запасом на случай медленной сети при
+        # редком кэш-промахе (обычно с кэшем шаг занимает 5-15 секунд).
 
       - name: Run monitor
         env:
