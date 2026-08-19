@@ -44,11 +44,13 @@ jobs:
 
       - name: Install Playwright browser
         timeout-minutes: 3
-        run: playwright install --with-deps chromium
-        # Не пропускаем даже при попадании в кэш - "--with-deps" также
-        # ставит нужные системные библиотеки, это быстро при готовом кэше.
-        # timeout-minutes: если apt/сеть зависнут (редко, но бывает на
-        # раннерах GitHub) - прогон упадёт за 3 минуты вместо 30+.
+        run: playwright install chromium
+        # Без "--with-deps" - этот флаг раньше вызывал apt-get update
+        # против внешних зеркал Ubuntu/Microsoft НА КАЖДОМ прогоне (кэш
+        # покрывает только сам браузер, не системные библиотеки), что и
+        # было причиной задержек в 3-5 минут, а иногда и 35+. Нужные для
+        # headless Chromium библиотеки на стандартных раннерах GitHub
+        # (ubuntu-latest) уже есть, apt-get тут не требуется.
 
       - name: Run monitor
         env:
