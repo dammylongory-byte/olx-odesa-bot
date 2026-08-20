@@ -76,12 +76,20 @@ HELP_TEXT = (
 def load_seen():
     if os.path.exists(SEEN_FILE):
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
-            return set(json.load(f))
-    return set()
+            data = json.load(f)
+        if isinstance(data, list):
+            # Старый формат (просто список ID) - конвертируем один раз.
+            # Помечаем всё как "old", чтобы не разослать повторно старую
+            # историю сразу после обновления бота на новый формат.
+            return {item_id: "old" for item_id in data}
+        return data
+    return {}
 
 
-def save_seen(seen_ids):
-    trimmed = list(seen_ids)[-3000:]  # чтобы файл не рос бесконечно
+def save_seen(seen):
+    # Оставляем только последние 3000 записей, чтобы файл не рос
+    # бесконечно (порядок вставки в словарях Python сохраняется).
+    trimmed = dict(list(seen.items())[-3000:])
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(trimmed, f, ensure_ascii=False)
 
@@ -289,6 +297,13 @@ def fetch_listings():
             try:
                 page.goto(page_url, timeout=60000, wait_until="domcontentloaded")
                 page.wait_for_selector('[data-testid="l-card"]', timeout=20000)
+                # Небольшая пауза: первая карточка появляется в DOM раньше,
+                # чем у ВСЕХ карточек на странице успевают дорисоваться
+                # ссылки/даты (React дорисовывает контент асинхронно). Без
+                # этой паузы изредка цеплялись неполные/устаревшие данные -
+                # то ссылка от другого объявления, то дата не "Сьогодні"
+                # у реально сегодняшнего объявления (и оно тихо терялось).
+                page.wait_for_timeout(1000)
             except Exception as e:
                 print(f"Не удалось загрузить страницу {page_num}: {e}")
                 if page_num == 1:
@@ -423,53 +438,58 @@ def main():
     state["consecutive_failures"] = 0  # сайт снова отвечает нормально
     print(f"Найдено объявлений (стр. 1-{PAGES_TO_SCAN}): {len(listings)}")
 
+    today_key = datetime.now(TZ).strftime("%d.%m.%Y")
+
     # Первый запуск: просто запоминаем текущие объявления,
     # чтобы не заспамить чат всей историей сразу
     if not seen:
-        save_seen({item["id"] for item in listings})
+        save_seen({item["id"]: "old" for item in listings})
         state["last_new_count"] = 0
         save_state(state)
         print(f"Первый запуск: сохранено {len(listings)} объявлений, уведомления не отправлялись.")
         return
 
-    new_items = [item for item in listings if item["id"] not in seen]
+    # Отправляем уведомление, только если у объявления сегодня стоит дата
+    # "Сьогодні" И мы ещё не отправляли его сегодня (маркер в seen не
+    # равен today_key). Храним не просто факт "видели/не видели", а
+    # ПОСЛЕДНЮЮ дату, когда его видели с пометкой "сегодня" - так, если
+    # объявление один раз ошибочно проскочило мимо (например, из-за
+    # временного сбоя при чтении страницы) и не было отправлено, при
+    # следующей проверке (пока дата на карточке всё ещё "Сьогодні") у него
+    # будет ещё один шанс уйти в уведомление, а не потеряться навсегда.
+    sent_items = []
+    skipped_count = 0
+    for item in listings:
+        is_today = "сьогодні" in item["location"].lower()
+        if is_today and seen.get(item["id"]) != today_key:
+            sent_items.append(item)
+            seen[item["id"]] = today_key
+        else:
+            seen[item["id"]] = today_key if is_today else "old"
+            skipped_count += 1
 
-    if not new_items:
+    if not sent_items:
         print("Новых объявлений нет.")
         state["last_new_count"] = 0
+        save_seen(seen)
         save_state(state)
         return
 
-    # Среди "новых по ID" бывают старые объявления, которые OLX иногда
-    # закрепляет наверху выдачи (топ/промо) независимо от даты публикации -
-    # они просто раньше не попадали в наш срез. Отправляем уведомление
-    # только если в дате стоит "Сьогодні" (сегодня), а остальные молча
-    # помечаем как просмотренные, чтобы не проверять их повторно и не слать.
-    todays_items = [item for item in new_items if "сьогодні" in item["location"].lower()]
-    older_items = [item for item in new_items if item not in todays_items]
-
-    all_seen = set(seen)
-    sent_items = []
-    for item in reversed(todays_items):  # от старых к новым
+    for item in reversed(sent_items):  # от старых к новым
         send_telegram(
             format_message(item),
             chat_id=TELEGRAM_NOTIFY_CHAT_ID,
             message_thread_id=TELEGRAM_NOTIFY_THREAD_ID,
         )
-        all_seen.add(item["id"])
-        sent_items.append(item)
         time.sleep(1)  # чтобы не упереться в лимиты Telegram
 
-    for item in older_items:
-        all_seen.add(item["id"])  # запоминаем, но не уведомляем
-
     record_stats(state, sent_items)
-    save_seen(all_seen)
+    save_seen(seen)
     state["last_new_count"] = len(sent_items)
     save_state(state)
     print(
         f"Отправлено новых объявлений за сегодня: {len(sent_items)} "
-        f"(пропущено старых/промо: {len(older_items)})"
+        f"(без изменений: {skipped_count})"
     )
 
 
