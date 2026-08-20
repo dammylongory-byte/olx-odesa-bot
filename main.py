@@ -77,19 +77,17 @@ def load_seen():
     if os.path.exists(SEEN_FILE):
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, list):
-            # Старый формат (просто список ID) - конвертируем один раз.
-            # Помечаем всё как "old", чтобы не разослать повторно старую
-            # историю сразу после обновления бота на новый формат.
-            return {item_id: "old" for item_id in data}
-        return data
-    return {}
+        if isinstance(data, dict):
+            # Промежуточный формат (словарь id -> дата) - конвертируем
+            # обратно в простой набор ID, чтобы вернуться к строгой логике
+            # "один раз увидели - больше никогда не шлём это же объявление".
+            return set(data.keys())
+        return set(data)
+    return set()
 
 
-def save_seen(seen):
-    # Оставляем только последние 3000 записей, чтобы файл не рос
-    # бесконечно (порядок вставки в словарях Python сохраняется).
-    trimmed = dict(list(seen.items())[-3000:])
+def save_seen(seen_ids):
+    trimmed = list(seen_ids)[-3000:]  # чтобы файл не рос бесконечно
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(trimmed, f, ensure_ascii=False)
 
@@ -422,7 +420,7 @@ def check_token_expiry(state):
 def main():
     state = load_state()
 
-    # Сначала отвечаем на команды, которые могли прийти с прошлого запуска -
+    # Сначала отвечаем на команды, которые могли прийти с прошлого запроса -
     # это дёшево (без браузера), поэтому делаем даже ночью.
     handle_commands(state)
 
@@ -454,70 +452,64 @@ def main():
     state["consecutive_failures"] = 0  # сайт снова отвечает нормально
     print(f"Найдено объявлений (стр. 1-{PAGES_TO_SCAN}): {len(listings)}")
 
-    today_key = datetime.now(TZ).strftime("%d.%m.%Y")
-
     # Первый запуск: просто запоминаем текущие объявления,
     # чтобы не заспамить чат всей историей сразу
     if not seen:
-        save_seen({item["id"]: "old" for item in listings})
+        save_seen({item["id"] for item in listings})
         state["last_new_count"] = 0
         save_state(state)
         print(f"Первый запуск: сохранено {len(listings)} объявлений, уведомления не отправлялись.")
         return
 
-    # Отправляем уведомление, только если у объявления сегодня стоит дата
-    # "Сьогодні" И мы ещё не отправляли его сегодня (маркер в seen не
-    # равен today_key). Храним не просто факт "видели/не видели", а
-    # ПОСЛЕДНЮЮ дату, когда его видели с пометкой "сегодня" - так, если
-    # объявление один раз ошибочно проскочило мимо (например, из-за
-    # временного сбоя при чтении страницы) и не было отправлено, при
-    # следующей проверке (пока дата на карточке всё ещё "Сьогодні") у него
-    # будет ещё один шанс уйти в уведомление, а не потеряться навсегда.
-    sent_items = []
-    to_send = []
-    skipped_count = 0
-    for item in listings:
-        is_today = "сьогодні" in item["location"].lower()
-        if is_today and seen.get(item["id"]) != today_key:
-            to_send.append(item)
-        else:
-            seen[item["id"]] = today_key if is_today else "old"
-            skipped_count += 1
+    new_items = [item for item in listings if item["id"] not in seen]
 
-    if not to_send:
+    if not new_items:
         print("Новых объявлений нет.")
         state["last_new_count"] = 0
-        save_seen(seen)
         save_state(state)
         return
 
-    # Помечаем в seen только то, что реально успешно отправилось - если
-    # какое-то сообщение не ушло даже после повторных попыток (например,
-    # Telegram временно недоступен), оно НЕ помечается и получит ещё один
-    # шанс на следующей проверке, вместо того чтобы тихо потеряться.
-    # save_seen/save_state вызываются в конце в любом случае, даже если
-    # часть сообщений не отправилась - один сбой не должен ронять весь
-    # прогон и обнулять уже сделанную работу.
-    for item in reversed(to_send):  # от старых к новым
+    # Среди "новых по ID" бывают старые объявления, которые OLX иногда
+    # закрепляет наверху выдачи (топ/промо) независимо от даты публикации -
+    # они просто раньше не попадали в наш срез. Отправляем уведомление
+    # только если в дате стоит "Сьогодні" (сегодня), а остальные молча
+    # помечаем как просмотренные, чтобы не проверять их повторно и не слать.
+    # ID у каждого объявления уникален и не меняется, даже если продавец
+    # его поднимет/обновит - строгое правило "один раз увидели -> больше
+    # никогда не шлём" гарантирует отсутствие дублей и "старых как новых".
+    todays_items = [item for item in new_items if "сьогодні" in item["location"].lower()]
+    older_items = [item for item in new_items if item not in todays_items]
+
+    all_seen = set(seen)
+    for item in older_items:
+        all_seen.add(item["id"])  # запоминаем, но не уведомляем
+
+    # Если какое-то сообщение не ушло даже после повторных попыток
+    # (например, Telegram временно недоступен) - НЕ добавляем его в seen,
+    # чтобы получить ещё один шанс отправить именно ЭТО объявление на
+    # следующей проверке (а не терять его). Уже успешно отправленные
+    # объявления помечаются сразу и больше никогда не пересматриваются.
+    sent_items = []
+    for item in reversed(todays_items):  # от старых к новым
         try:
             send_telegram(
                 format_message(item),
                 chat_id=TELEGRAM_NOTIFY_CHAT_ID,
                 message_thread_id=TELEGRAM_NOTIFY_THREAD_ID,
             )
-            seen[item["id"]] = today_key
+            all_seen.add(item["id"])
             sent_items.append(item)
         except Exception as e:
             print(f"Не удалось отправить объявление {item['id']}: {e}")
         time.sleep(3)  # чтобы не упереться в лимит Telegram (~20 сообщ/мин в один чат)
 
     record_stats(state, sent_items)
-    save_seen(seen)
+    save_seen(all_seen)
     state["last_new_count"] = len(sent_items)
     save_state(state)
     print(
         f"Отправлено новых объявлений за сегодня: {len(sent_items)} "
-        f"(без изменений: {skipped_count})"
+        f"(пропущено старых/промо: {len(older_items)})"
     )
 
 
