@@ -129,7 +129,7 @@ def is_night_time():
     return NIGHT_START_HOUR <= hour < NIGHT_END_HOUR
 
 
-def send_telegram(text, chat_id=None, message_thread_id=None):
+def send_telegram(text, chat_id=None, message_thread_id=None, max_retries=3):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": chat_id or TELEGRAM_CHAT_ID,
@@ -139,8 +139,24 @@ def send_telegram(text, chat_id=None, message_thread_id=None):
     }
     if message_thread_id:
         payload["message_thread_id"] = message_thread_id
-    r = requests.post(url, data=payload, timeout=15)
-    r.raise_for_status()
+
+    for attempt in range(max_retries + 1):
+        r = requests.post(url, data=payload, timeout=15)
+        if r.status_code == 429:
+            # Telegram просит подождать - уважаем Retry-After (обычно
+            # приходит и в заголовке, и в теле ответа как retry_after).
+            wait_s = int(r.headers.get("Retry-After", 0))
+            if not wait_s:
+                try:
+                    wait_s = int(r.json().get("parameters", {}).get("retry_after", 5))
+                except Exception:
+                    wait_s = 5
+            if attempt < max_retries:
+                print(f"Telegram 429, жду {wait_s} сек. и пробую снова...")
+                time.sleep(wait_s + 1)
+                continue
+        r.raise_for_status()
+        return
 
 
 def parse_price_usd(price_str):
@@ -458,30 +474,42 @@ def main():
     # следующей проверке (пока дата на карточке всё ещё "Сьогодні") у него
     # будет ещё один шанс уйти в уведомление, а не потеряться навсегда.
     sent_items = []
+    to_send = []
     skipped_count = 0
     for item in listings:
         is_today = "сьогодні" in item["location"].lower()
         if is_today and seen.get(item["id"]) != today_key:
-            sent_items.append(item)
-            seen[item["id"]] = today_key
+            to_send.append(item)
         else:
             seen[item["id"]] = today_key if is_today else "old"
             skipped_count += 1
 
-    if not sent_items:
+    if not to_send:
         print("Новых объявлений нет.")
         state["last_new_count"] = 0
         save_seen(seen)
         save_state(state)
         return
 
-    for item in reversed(sent_items):  # от старых к новым
-        send_telegram(
-            format_message(item),
-            chat_id=TELEGRAM_NOTIFY_CHAT_ID,
-            message_thread_id=TELEGRAM_NOTIFY_THREAD_ID,
-        )
-        time.sleep(1)  # чтобы не упереться в лимиты Telegram
+    # Помечаем в seen только то, что реально успешно отправилось - если
+    # какое-то сообщение не ушло даже после повторных попыток (например,
+    # Telegram временно недоступен), оно НЕ помечается и получит ещё один
+    # шанс на следующей проверке, вместо того чтобы тихо потеряться.
+    # save_seen/save_state вызываются в конце в любом случае, даже если
+    # часть сообщений не отправилась - один сбой не должен ронять весь
+    # прогон и обнулять уже сделанную работу.
+    for item in reversed(to_send):  # от старых к новым
+        try:
+            send_telegram(
+                format_message(item),
+                chat_id=TELEGRAM_NOTIFY_CHAT_ID,
+                message_thread_id=TELEGRAM_NOTIFY_THREAD_ID,
+            )
+            seen[item["id"]] = today_key
+            sent_items.append(item)
+        except Exception as e:
+            print(f"Не удалось отправить объявление {item['id']}: {e}")
+        time.sleep(3)  # чтобы не упереться в лимит Telegram (~20 сообщ/мин в один чат)
 
     record_stats(state, sent_items)
     save_seen(seen)
