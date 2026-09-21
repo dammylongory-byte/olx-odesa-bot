@@ -326,7 +326,7 @@ def fetch_listings():
                     # этой паузы изредка цеплялись неполные/устаревшие данные -
                     # то ссылка от другого объявления, то дата не "Сьогодні"
                     # у реально сегодняшнего объявления (и оно тихо терялось).
-                    page.wait_for_timeout(1000)
+                    page.wait_for_timeout(1800)
                     loaded = True
                     break
                 except Exception as e:
@@ -497,12 +497,16 @@ def main():
     # его поднимет/обновит - строгое правило "один раз увидели -> больше
     # никогда не шлём" гарантирует отсутствие дублей и "старых как новых".
     todays_items = [item for item in new_items if "сьогодні" in item["location"].lower()]
-    older_items = [item for item in new_items if item not in todays_items]
-
+    unparsed_items = [item for item in new_items if item not in todays_items and not item["location"].strip()]
+    older_items = [item for item in new_items if item not in todays_items and item not in unparsed_items]
     all_seen = set(seen)
     for item in older_items:
         all_seen.add(item["id"])  # запоминаем, но не уведомляем
 
+    # unparsed_items НЕ добавляем в seen: пустая дата почти всегда значит,
+    # что React ещё не дорендерил карточку, а не что объявление старое -
+    # даём ему ещё один шанс на следующей проверке (через 5 минут).
+    
     # Если какое-то сообщение не ушло даже после повторных попыток
     # (например, Telegram временно недоступен) - НЕ добавляем его в seen,
     # чтобы получить ещё один шанс отправить именно ЭТО объявление на
@@ -528,7 +532,7 @@ def main():
     save_state(state)
     print(
         f"Отправлено новых объявлений за сегодня: {len(sent_items)} "
-        f"(пропущено старых/промо: {len(older_items)})"
+        f"(пропущено старых/промо: {len(older_items)}, ждут перепроверки: {len(unparsed_items)})"
     )
 
 
